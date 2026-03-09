@@ -18,7 +18,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from .analyzer import analyze_entry, run_batch_analysis
+from .analyzer import (
+    analyze_entry,
+    run_batch_long_term,
+    run_batch_short_term,
+    run_full_analysis,
+)
 from .database import Database
 from .importer import import_raindrop_csv
 from .models import Entry
@@ -121,11 +126,11 @@ def cmd_list(args: argparse.Namespace, db: Database) -> int:
     return 0
 
 
-def cmd_analyze(_args: argparse.Namespace, db: Database) -> int:
+def cmd_analyze(args: argparse.Namespace, db: Database) -> int:
     """バッチ分析コマンド。
 
     Args:
-        _args: CLIパース済み引数（未使用）。
+        args: CLIパース済み引数。
         db: Databaseオブジェクト。
 
     Returns:
@@ -136,15 +141,81 @@ def cmd_analyze(_args: argparse.Namespace, db: Database) -> int:
         print("エントリーがありません。先に `add` または `import` コマンドを実行してください。")
         return 1
 
-    print(f"{total}件のエントリーをバッチ分析中...")
-    report = run_batch_analysis(db)
-    if report is None:
-        print("エラー: バッチ分析に失敗しました。", file=sys.stderr)
+    # --full: 2層レポート（短期 + 長期）
+    if args.full:
+        print("2層レポートを生成中（短期 + 長期）...")
+        report = run_full_analysis(db)
+        if report is None:
+            print("エラー: 2層分析に失敗しました。", file=sys.stderr)
+            return 1
+        if report.get("expanded_period"):
+            print("  ※ 直近7日間の保存が少ないため14日間に拡張しました。")
+        st = report.get("short_term", {})
+        lt = report.get("long_term", {})
+        print(
+            f"分析完了: 短期アクション {len(st.get('baby_step_actions', []))}件、"
+            f"メタカテゴリ {len(lt.get('meta_categories', []))}件"
+        )
+        print("`report` コマンドで結果を確認できます。")
+        return 0
+
+    # --recent N: 直近N件を短期分析
+    if args.recent is not None:
+        entries = db.get_recent_entries(args.recent)
+        if not entries:
+            print("分析済みエントリーがありません。")
+            return 1
+        print(f"直近{args.recent}件を短期分析中...")
+        report = run_batch_short_term(entries, days=args.recent)
+        if report is None:
+            print("エラー: 短期分析に失敗しました。", file=sys.stderr)
+            return 1
+        db.save_batch_report(
+            report,
+            report_type="short_term",
+            period_days=0,
+            entry_count=len(entries),
+        )
+        print(f"分析完了: アクション提案 {len(report.get('baby_step_actions', []))}件")
+        print("`report` コマンドで結果を確認できます。")
+        return 0
+
+    # --days 0: 全期間を長期分析
+    # --days N (デフォルト7): N日間を短期分析
+    days = args.days
+    entries = db.get_entries_by_period(days=days)
+    if not entries:
+        label = "全期間" if days == 0 else f"直近{days}日間"
+        print(f"{label}の分析済みエントリーがありません。")
         return 1
 
-    n_cats = len(report.get("meta_categories", []))
-    n_actions = len(report.get("micro_actions", []))
-    print(f"分析完了: メタカテゴリ {n_cats}件、アクション提案 {n_actions}件")
+    if days == 0:
+        print(f"全期間（{len(entries)}件）を長期分析中...")
+        report = run_batch_long_term(entries)
+        if report is None:
+            print("エラー: 長期分析に失敗しました。", file=sys.stderr)
+            return 1
+        db.save_batch_report(
+            report,
+            report_type="long_term",
+            period_days=0,
+            entry_count=len(entries),
+        )
+        print(f"分析完了: メタカテゴリ {len(report.get('meta_categories', []))}件")
+    else:
+        print(f"直近{days}日間（{len(entries)}件）を短期分析中...")
+        report = run_batch_short_term(entries, days=days)
+        if report is None:
+            print("エラー: 短期分析に失敗しました。", file=sys.stderr)
+            return 1
+        db.save_batch_report(
+            report,
+            report_type="short_term",
+            period_days=days,
+            entry_count=len(entries),
+        )
+        print(f"分析完了: アクション提案 {len(report.get('baby_step_actions', []))}件")
+
     print("`report` コマンドで結果を確認できます。")
     return 0
 
@@ -190,7 +261,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.add_argument("--limit", "-n", type=int, default=20, help="表示件数（デフォルト: 20）")
 
     # analyze
-    sub.add_parser("analyze", help="全エントリーをバッチ分析してアクション提案を生成する")
+    p_analyze = sub.add_parser("analyze", help="エントリーを分析してアクション提案を生成する")
+    p_analyze.add_argument(
+        "--days", type=int, default=7,
+        help="分析対象の日数（0で全期間、デフォルト: 7）",
+    )
+    p_analyze.add_argument(
+        "--recent", type=int, default=None,
+        help="直近N件を分析",
+    )
+    p_analyze.add_argument(
+        "--full", action="store_true",
+        help="2層レポート（短期7日+長期全期間）を同時生成（推奨）",
+    )
 
     # report
     sub.add_parser("report", help="最新のバッチ分析レポートを表示する")

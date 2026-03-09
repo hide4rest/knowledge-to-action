@@ -28,6 +28,7 @@ class Database:
         self._conn = sqlite3.connect(str(self.db_path))
         self._conn.row_factory = sqlite3.Row
         self._create_tables()
+        self._migrate_tables()
         logger.debug("データベース接続: %s", self.db_path)
 
     def close(self) -> None:
@@ -142,6 +143,72 @@ class Database:
         """
         return self._conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
 
+    def get_entries_by_period(self, days: int) -> list[dict]:
+        """指定日数以内のエントリーと分析結果を取得する。
+
+        Args:
+            days: 遡る日数。0の場合は全件取得。
+
+        Returns:
+            エントリーと分析結果を含むdictのリスト。
+        """
+        if days == 0:
+            return self.get_entries_with_analyses()
+
+        rows = self._conn.execute(
+            """
+            SELECT e.id, e.url, e.title, e.description, e.created_at,
+                   a.summary, a.category, a.subcategory, a.keywords_json,
+                   a.actionability, a.intent_guess
+            FROM entries e
+            JOIN analyses a ON a.entry_id = e.id
+            WHERE e.created_at >= datetime('now', ?)
+            ORDER BY e.created_at DESC
+            """,
+            (f"-{days} days",),
+        ).fetchall()
+        return self._rows_to_dicts(rows)
+
+    def get_recent_entries(self, limit: int) -> list[dict]:
+        """直近N件のエントリーと分析結果を取得する。
+
+        Args:
+            limit: 取得件数。
+
+        Returns:
+            エントリーと分析結果を含むdictのリスト（created_at降順）。
+        """
+        rows = self._conn.execute(
+            """
+            SELECT e.id, e.url, e.title, e.description, e.created_at,
+                   a.summary, a.category, a.subcategory, a.keywords_json,
+                   a.actionability, a.intent_guess
+            FROM entries e
+            JOIN analyses a ON a.entry_id = e.id
+            ORDER BY e.created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return self._rows_to_dicts(rows)
+
+    def get_entry_count_by_period(self, days: int) -> int:
+        """指定期間内のエントリー数を返す。
+
+        Args:
+            days: 遡る日数。0の場合は全件。
+
+        Returns:
+            エントリー数。
+        """
+        if days == 0:
+            return self.count_entries()
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM entries WHERE created_at >= datetime('now', ?)",
+            (f"-{days} days",),
+        ).fetchone()
+        return row[0]
+
     # ------------------------------------------------------------------ #
     # 分析結果操作
     # ------------------------------------------------------------------ #
@@ -243,6 +310,11 @@ class Database:
             ORDER BY e.created_at DESC
             """
         ).fetchall()
+        return self._rows_to_dicts(rows)
+
+    @staticmethod
+    def _rows_to_dicts(rows: list) -> list[dict]:
+        """SQLite Rowのリストをdictのリストに変換する。"""
         result = []
         for r in rows:
             d = dict(r)
@@ -254,21 +326,39 @@ class Database:
     # バッチレポート操作
     # ------------------------------------------------------------------ #
 
-    def save_batch_report(self, report: dict) -> int:
+    def save_batch_report(
+        self,
+        report: dict,
+        report_type: str = "full",
+        period_days: int = 0,
+        entry_count: int = 0,
+    ) -> int:
         """バッチ分析レポートを保存する。
 
         Args:
             report: レポートデータのdict。
+            report_type: レポート種別（'full', 'short_term', 'long_term', 'legacy'）。
+            period_days: 分析対象の日数（0 = 全期間）。
+            entry_count: 分析対象のエントリー数。
 
         Returns:
             保存されたレポートのID。
         """
         cur = self._conn.execute(
-            "INSERT INTO batch_reports (report_json, created_at) VALUES (?, ?)",
-            (json.dumps(report, ensure_ascii=False), datetime.now().isoformat()),
+            """
+            INSERT INTO batch_reports (report_type, report_json, period_days, entry_count, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                report_type,
+                json.dumps(report, ensure_ascii=False),
+                period_days,
+                entry_count,
+                datetime.now().isoformat(),
+            ),
         )
         self._conn.commit()
-        logger.info("バッチレポートを保存: id=%d", cur.lastrowid)
+        logger.info("バッチレポートを保存: id=%d type=%s", cur.lastrowid, report_type)
         return cur.lastrowid
 
     def get_latest_batch_report(self) -> Optional[dict]:
@@ -278,12 +368,16 @@ class Database:
             レポートデータのdict。存在しない場合はNone。
         """
         row = self._conn.execute(
-            "SELECT report_json, created_at FROM batch_reports ORDER BY created_at DESC LIMIT 1"
+            "SELECT report_json, created_at, report_type FROM batch_reports ORDER BY created_at DESC LIMIT 1"
         ).fetchone()
         if row is None:
             return None
         report = json.loads(row["report_json"])
         report["_created_at"] = row["created_at"]
+        try:
+            report["_report_type"] = row["report_type"] or "legacy"
+        except (IndexError, KeyError):
+            report["_report_type"] = "legacy"
         return report
 
     # ------------------------------------------------------------------ #
@@ -318,12 +412,29 @@ class Database:
 
             CREATE TABLE IF NOT EXISTS batch_reports (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_type TEXT    DEFAULT 'full',
                 report_json TEXT    NOT NULL,
+                period_days INTEGER DEFAULT 0,
+                entry_count INTEGER DEFAULT 0,
                 created_at  TEXT    NOT NULL
             );
             """
         )
         self._conn.commit()
+
+    def _migrate_tables(self) -> None:
+        """既存テーブルにカラムを追加する（マイグレーション）。"""
+        migrations = [
+            "ALTER TABLE batch_reports ADD COLUMN report_type TEXT DEFAULT 'legacy'",
+            "ALTER TABLE batch_reports ADD COLUMN period_days INTEGER DEFAULT 0",
+            "ALTER TABLE batch_reports ADD COLUMN entry_count INTEGER DEFAULT 0",
+        ]
+        for sql in migrations:
+            try:
+                self._conn.execute(sql)
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass  # カラムが既に存在する場合は無視
 
 
 # ------------------------------------------------------------------ #
